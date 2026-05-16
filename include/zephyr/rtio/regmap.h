@@ -131,11 +131,15 @@ static inline void rtio_read_regs_async(struct rtio *r, struct rtio_iodev *iodev
 
 		rtio_sqe_prep_tiny_write(write_addr, iodev, RTIO_PRIO_NORM,
 					 &regs->rtio_regs_list[i].reg_addr, 1, NULL);
-		write_addr->flags = RTIO_SQE_TRANSACTION;
+		/* RTIO_SQE_NO_RESPONSE suppresses the internal bus-op CQE so it
+		 * never enters the shared CQ.  The completion callback (complete_op)
+		 * is the sole completion signal; it is always invoked via the
+		 * RTIO_SQE_CHAINED path regardless of bus success or failure. */
+		write_addr->flags = RTIO_SQE_TRANSACTION | RTIO_SQE_NO_RESPONSE;
 
 		rtio_sqe_prep_read(read_reg, iodev, RTIO_PRIO_NORM, regs->rtio_regs_list[i].bufp,
 				   regs->rtio_regs_list[i].len, NULL);
-		read_reg->flags = RTIO_SQE_CHAINED;
+		read_reg->flags = RTIO_SQE_CHAINED | RTIO_SQE_NO_RESPONSE;
 
 		switch (bus_type) {
 		case RTIO_BUS_I2C:

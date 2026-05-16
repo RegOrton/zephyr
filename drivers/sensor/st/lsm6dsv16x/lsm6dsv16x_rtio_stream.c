@@ -291,10 +291,15 @@ static void lsm6dsv16x_read_fifo_cb(struct rtio *r, const struct rtio_sqe *sqe,
 	uint8_t fifo_th = 0, fifo_full = 0;
 	uint16_t fifo_count;
 
-	/* At this point, no sqe request is queued should be considered as a bug */
-	__ASSERT_NO_MSG(lsm6dsv16x->streaming_sqe != NULL);
+	/* Capture iodev_sqe from userdata — this is the SQE that was current when
+	 * the IRQ handler submitted the FIFO_STATUS read.  Using streaming_sqe
+	 * directly is racy: a concurrent rearm may have updated streaming_sqe to
+	 * a new SQE by the time this callback runs. */
+	struct rtio_iodev_sqe *iodev_sqe = (struct rtio_iodev_sqe *)sqe->userdata;
 
-	read_config = (struct sensor_read_config *)lsm6dsv16x->streaming_sqe->sqe.iodev->data;
+	__ASSERT_NO_MSG(iodev_sqe != NULL);
+
+	read_config = (struct sensor_read_config *)iodev_sqe->sqe.iodev->data;
 	__ASSERT_NO_MSG(read_config != NULL);
 	__ASSERT_NO_MSG(read_config->is_streaming == true);
 
@@ -336,17 +341,10 @@ static void lsm6dsv16x_read_fifo_cb(struct rtio *r, const struct rtio_sqe *sqe,
 		return;
 	}
 
-	/* flush completion */
-	int res = 0;
-
-	res = rtio_flush_completion_queue(rtio);
-
-	/* Bail/cancel attempt to read sensor on any error */
-	if (res != 0) {
-		rtio_iodev_sqe_err(lsm6dsv16x->streaming_sqe, res);
-		lsm6dsv16x->streaming_sqe = NULL;
-		return;
-	}
+	/* No flush loop: write_addr and read_reg in rtio_read_regs_async() carry
+	 * RTIO_SQE_NO_RESPONSE so they generate no CQEs into the shared CQ.
+	 * The app thread remains the sole CQ consumer — the MPSC single-consumer
+	 * contract is satisfied without any extra flushing here. */
 
 	enum sensor_stream_data_opt data_opt;
 
@@ -365,11 +363,9 @@ static void lsm6dsv16x_read_fifo_cb(struct rtio *r, const struct rtio_sqe *sqe,
 		uint8_t *buf;
 		uint32_t buf_len;
 
-		/* Clear streaming_sqe since we're done with the call */
-		if (rtio_sqe_rx_buf(lsm6dsv16x->streaming_sqe, sizeof(struct lsm6dsv16x_fifo_data),
+		if (rtio_sqe_rx_buf(iodev_sqe, sizeof(struct lsm6dsv16x_fifo_data),
 				    sizeof(struct lsm6dsv16x_fifo_data), &buf, &buf_len) != 0) {
-			rtio_iodev_sqe_err(lsm6dsv16x->streaming_sqe, -ENOMEM);
-			lsm6dsv16x->streaming_sqe = NULL;
+			rtio_iodev_sqe_err(iodev_sqe, -ENOMEM);
 			if (!ON_I3C_BUS(config) || (I3C_INT_PIN(config))) {
 				gpio_pin_interrupt_configure_dt(irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 			}
@@ -385,8 +381,7 @@ static void lsm6dsv16x_read_fifo_cb(struct rtio *r, const struct rtio_sqe *sqe,
 		rx_data->fifo_count = 0;
 
 		/* complete request with ok */
-		rtio_iodev_sqe_ok(lsm6dsv16x->streaming_sqe, 0);
-		lsm6dsv16x->streaming_sqe = NULL;
+		rtio_iodev_sqe_ok(iodev_sqe, 0);
 		if (!ON_I3C_BUS(config) || (I3C_INT_PIN(config))) {
 			gpio_pin_interrupt_configure_dt(irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 		}
@@ -422,10 +417,9 @@ static void lsm6dsv16x_read_fifo_cb(struct rtio *r, const struct rtio_sqe *sqe,
 	uint32_t fifo_read_size = LSM6DSV16X_FIFO_SIZE(fifo_count);
 	uint32_t req_len = fifo_read_size + sizeof(struct lsm6dsv16x_fifo_data);
 
-	if (rtio_sqe_rx_buf(lsm6dsv16x->streaming_sqe, req_len, req_len, &buf, &buf_len) != 0) {
+	if (rtio_sqe_rx_buf(iodev_sqe, req_len, req_len, &buf, &buf_len) != 0) {
 		LOG_ERR("Failed to get buffer");
-		rtio_iodev_sqe_err(lsm6dsv16x->streaming_sqe, -ENOMEM);
-		lsm6dsv16x->streaming_sqe = NULL;
+		rtio_iodev_sqe_err(iodev_sqe, -ENOMEM);
 		if (!ON_I3C_BUS(config) || (I3C_INT_PIN(config))) {
 			gpio_pin_interrupt_configure_dt(irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 		}
@@ -483,7 +477,7 @@ static void lsm6dsv16x_read_fifo_cb(struct rtio *r, const struct rtio_sqe *sqe,
 	 *   }
 	 */
 	rtio_read_regs_async(lsm6dsv16x->rtio_ctx, lsm6dsv16x->iodev, lsm6dsv16x->bus_type,
-			     &fifo_regs, lsm6dsv16x->streaming_sqe, dev, lsm6dsv16x_complete_op_cb);
+			     &fifo_regs, iodev_sqe, dev, lsm6dsv16x_complete_op_cb);
 }
 
 /*
@@ -504,10 +498,14 @@ static void lsm6dsv16x_read_status_cb(struct rtio *r, const struct rtio_sqe *sqe
 	struct gpio_dt_spec *irq_gpio = lsm6dsv16x->drdy_gpio;
 	struct sensor_read_config *read_config;
 
-	/* At this point, no sqe request is queued should be considered as a bug */
-	__ASSERT_NO_MSG(lsm6dsv16x->streaming_sqe != NULL);
+	/* Capture iodev_sqe from userdata — same race-safety rationale as
+	 * lsm6dsv16x_read_fifo_cb: streaming_sqe may have been updated by a
+	 * concurrent rearm before this callback runs. */
+	struct rtio_iodev_sqe *iodev_sqe = (struct rtio_iodev_sqe *)sqe->userdata;
 
-	read_config = (struct sensor_read_config *)lsm6dsv16x->streaming_sqe->sqe.iodev->data;
+	__ASSERT_NO_MSG(iodev_sqe != NULL);
+
+	read_config = (struct sensor_read_config *)iodev_sqe->sqe.iodev->data;
 	__ASSERT_NO_MSG(read_config != NULL);
 	__ASSERT_NO_MSG(read_config->is_streaming == true);
 
@@ -521,17 +519,8 @@ static void lsm6dsv16x_read_status_cb(struct rtio *r, const struct rtio_sqe *sqe
 		}
 	}
 
-	/* flush completion */
-	int res = 0;
-
-	res = rtio_flush_completion_queue(rtio);
-
-	/* Bail/cancel attempt to read sensor on any error */
-	if (res != 0) {
-		rtio_iodev_sqe_err(lsm6dsv16x->streaming_sqe, res);
-		lsm6dsv16x->streaming_sqe = NULL;
-		return;
-	}
+	/* No flush loop: RTIO_SQE_NO_RESPONSE on the bus-op SQEs suppresses
+	 * internal CQEs so the app thread is the sole CQ consumer. */
 
 	if (data_ready != NULL &&
 	    (data_ready->opt == SENSOR_STREAM_DATA_NOP ||
@@ -540,10 +529,9 @@ static void lsm6dsv16x_read_status_cb(struct rtio *r, const struct rtio_sqe *sqe
 		uint32_t buf_len;
 
 		/* Clear streaming_sqe since we're done with the call */
-		if (rtio_sqe_rx_buf(lsm6dsv16x->streaming_sqe, sizeof(struct lsm6dsv16x_rtio_data),
+		if (rtio_sqe_rx_buf(iodev_sqe, sizeof(struct lsm6dsv16x_rtio_data),
 				    sizeof(struct lsm6dsv16x_rtio_data), &buf, &buf_len) != 0) {
-			rtio_iodev_sqe_err(lsm6dsv16x->streaming_sqe, -ENOMEM);
-			lsm6dsv16x->streaming_sqe = NULL;
+			rtio_iodev_sqe_err(iodev_sqe, -ENOMEM);
 			if (!ON_I3C_BUS(config) || (I3C_INT_PIN(config))) {
 				gpio_pin_interrupt_configure_dt(irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 			}
@@ -560,8 +548,7 @@ static void lsm6dsv16x_read_status_cb(struct rtio *r, const struct rtio_sqe *sqe
 		rx_data->has_temp = 0;
 
 		/* complete request with ok */
-		rtio_iodev_sqe_ok(lsm6dsv16x->streaming_sqe, 0);
-		lsm6dsv16x->streaming_sqe = NULL;
+		rtio_iodev_sqe_ok(iodev_sqe, 0);
 		if (!ON_I3C_BUS(config) || (I3C_INT_PIN(config))) {
 			gpio_pin_interrupt_configure_dt(irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 		}
@@ -580,11 +567,9 @@ static void lsm6dsv16x_read_status_cb(struct rtio *r, const struct rtio_sqe *sqe
 		uint32_t buf_len;
 		uint32_t req_len = 6 + sizeof(struct lsm6dsv16x_rtio_data);
 
-		if (rtio_sqe_rx_buf(lsm6dsv16x->streaming_sqe,
-				    req_len, req_len, &buf, &buf_len) != 0) {
+		if (rtio_sqe_rx_buf(iodev_sqe, req_len, req_len, &buf, &buf_len) != 0) {
 			LOG_ERR("Failed to get buffer");
-			rtio_iodev_sqe_err(lsm6dsv16x->streaming_sqe, -ENOMEM);
-			lsm6dsv16x->streaming_sqe = NULL;
+			rtio_iodev_sqe_err(iodev_sqe, -ENOMEM);
 			if (!ON_I3C_BUS(config) || (I3C_INT_PIN(config))) {
 				gpio_pin_interrupt_configure_dt(irq_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 			}
@@ -631,7 +616,7 @@ static void lsm6dsv16x_read_status_cb(struct rtio *r, const struct rtio_sqe *sqe
 		 *   lsm6dsv16x_acceleration_raw_get(&dev_ctx, accel_raw);
 		 */
 		rtio_read_regs_async(lsm6dsv16x->rtio_ctx, lsm6dsv16x->iodev, lsm6dsv16x->bus_type,
-				     &fifo_regs, lsm6dsv16x->streaming_sqe, dev,
+				     &fifo_regs, iodev_sqe, dev,
 				     lsm6dsv16x_complete_op_cb);
 	}
 }
@@ -657,10 +642,16 @@ void lsm6dsv16x_stream_irq_handler(const struct device *dev)
 		return;
 	}
 
+	/* Latch streaming_sqe once so all async calls below use the same pointer.
+	 * A concurrent rearm via sensor_stream() could overwrite streaming_sqe
+	 * between two direct reads if we used the field directly. */
+	struct rtio_iodev_sqe *stream_sqe = lsm6dsv16x->streaming_sqe;
+
 	rc = sensor_clock_get_cycles(&cycles);
 	if (rc != 0) {
 		LOG_ERR("Failed to get sensor clock cycles");
-		rtio_iodev_sqe_err(lsm6dsv16x->streaming_sqe, rc);
+		lsm6dsv16x->streaming_sqe = NULL;
+		rtio_iodev_sqe_err(stream_sqe, rc);
 		return;
 	}
 
@@ -714,9 +705,17 @@ void lsm6dsv16x_stream_irq_handler(const struct device *dev)
 			 *
 			 *   lsm6dsv16x_fifo_status_get(&dev_ctx, &fifo_status);
 			 */
+			/* Null streaming_sqe before handing it to the async bus op.
+			 * If rtio_read_regs_async() cannot allocate SQEs it calls
+			 * rtio_iodev_sqe_err() which frees stream_sqe; without this
+			 * NULL the stale pointer would cause a double-free on the
+			 * next interrupt.  On success, lsm6dsv16x_submit_stream()
+			 * restores streaming_sqe when the multishot SQE is
+			 * re-submitted. */
+			lsm6dsv16x->streaming_sqe = NULL;
 			rtio_read_regs_async(lsm6dsv16x->rtio_ctx, lsm6dsv16x->iodev,
 					     lsm6dsv16x->bus_type, &fifo_regs,
-					     lsm6dsv16x->streaming_sqe, dev,
+					     stream_sqe, dev,
 					     lsm6dsv16x_read_fifo_cb);
 
 #if LSM6DSVXXX_ANY_INST_ON_BUS_STATUS_OKAY(i3c)
@@ -752,8 +751,10 @@ void lsm6dsv16x_stream_irq_handler(const struct device *dev)
 		 *
 		 *   lsm6dsv16x_flag_data_ready_get(&dev_ctx, &drdy);
 		 */
+		/* Same guard as the FIFO path above. */
+		lsm6dsv16x->streaming_sqe = NULL;
 		rtio_read_regs_async(lsm6dsv16x->rtio_ctx, lsm6dsv16x->iodev, lsm6dsv16x->bus_type,
-				     &fifo_regs, lsm6dsv16x->streaming_sqe, dev,
+				     &fifo_regs, stream_sqe, dev,
 				     lsm6dsv16x_read_status_cb);
 	}
 }
